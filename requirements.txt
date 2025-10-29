@@ -1,0 +1,13 @@
+# 酷歌詞爬蟲工具依賴套件
+# Kugeci Lyrics Crawler Dependencies
+
+# 網頁爬取
+requests>=2.25.1
+beautifulsoup4>=4.9.3
+lxml>=4.6.3
+
+# GUI框架 (Python內建，無需安裝)
+# tkinter - 內建於Python標準庫
+
+# 其他依賴
+urllib3>=1.26.5
