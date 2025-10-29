@@ -14,7 +14,7 @@ with open("requirements.txt", "r", encoding="utf-8") as fh:
 
 setup(
     name="kugeci-lyrics-crawler",
-    version="1.0.0",
+    version="1.1.0",
     author="Kugeci Lyrics Crawler Team",
     author_email="",
     description="一個功能強大的圖形界面歌詞爬蟲工具",

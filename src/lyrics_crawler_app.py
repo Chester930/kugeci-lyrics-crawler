@@ -31,6 +31,15 @@ class LyricsCrawlerApp:
         self.headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         }
+        # 請求穩定性設置
+        self.request_timeout = 15
+        self.max_retries = 3
+        self.backoff_base = 1.8  # 指數退避底數
+        self.jitter_seconds = 0.3
+        # 共用 Session 以提升連線重用與穩定性
+        import requests as _req
+        self.session = _req.Session()
+        self.session.headers.update(self.headers)
         self.is_crawling = False
         
         self.create_widgets()
@@ -234,6 +243,72 @@ class LyricsCrawlerApp:
         # 初始化界面狀態
         self.toggle_type()
         self.toggle_mode()
+
+    def _normalize_name(self, text: str) -> str:
+        """名稱正規化：移除空白與大小寫差異，提升匹配穩定性。"""
+        import re as _re
+        return _re.sub(r"\s+", "", (text or "").strip()).lower()
+
+    def http_get(self, url: str, delay: float, allow_retry: bool = True):
+        """具重試與退避機制的 GET。
+        - 對 429/5xx/空內容/疑似防護頁（Cloudflare）進行重試
+        - 使用共用 Session，並支援基礎抖動
+        """
+        import random as _rand
+        import time as _time
+        last_exc = None
+        attempts = self.max_retries if allow_retry else 1
+        for attempt in range(1, attempts + 1):
+            try:
+                if delay and attempt == 1:
+                    _time.sleep(delay)
+                elif attempt > 1:
+                    backoff = (self.backoff_base ** (attempt - 1)) + _rand.uniform(0, self.jitter_seconds)
+                    self.log(f"    重試第{attempt}次，等待 {backoff:.1f}s ...")
+                    _time.sleep(backoff)
+
+                resp = self.session.get(url, timeout=self.request_timeout)
+                text = resp.text if resp and hasattr(resp, 'text') else ''
+                # 判斷可疑頁面
+                suspicious = any(k in text for k in [
+                    'Just a moment', 'Checking your browser', 'Cloudflare', '注意安全', '人机验证'
+                ])
+                if resp.status_code == 200 and text.strip() and not suspicious:
+                    return resp
+                else:
+                    self.log(f"    請求非預期 HTTP {resp.status_code} 或內容可疑，準備重試")
+            except Exception as e:  # 僅在網路層重試
+                last_exc = e
+                self.log(f"    請求錯誤: {e}")
+        if last_exc:
+            raise last_exc
+        return None
+
+    def _build_paged_url(self, url: str, page: int) -> str:
+        """為人物頁建立分頁 URL。若原本已有 query，追加 &page=，否則 ?page=."""
+        from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
+        parsed = urlparse(url)
+        query = dict(parse_qsl(parsed.query))
+        query['page'] = str(page)
+        new_qs = urlencode(query)
+        return urlunparse(parsed._replace(query=new_qs))
+
+    def _extract_max_page(self, soup: BeautifulSoup, current_url: str) -> int:
+        """從頁面中的分頁連結推斷最大頁碼，找不到時回傳 1。"""
+        try:
+            anchors = soup.find_all('a', href=True)
+            max_page = 1
+            for a in anchors:
+                href = a.get('href', '')
+                if 'page=' in href:
+                    # 解析整數頁碼
+                    import re as _re
+                    m = _re.search(r'[?&]page=(\d+)', href)
+                    if m:
+                        max_page = max(max_page, int(m.group(1)))
+            return max_page
+        except Exception:
+            return 1
     
     def toggle_type(self):
         """根據選擇的類型更新提示文字"""
@@ -451,7 +526,7 @@ class LyricsCrawlerApp:
         try:
             time.sleep(delay)
             url = f"{self.base_url}/writers?page={page_num}"
-            response = requests.get(url, headers=self.headers, timeout=15)
+            response = self.http_get(url, delay)
             soup = BeautifulSoup(response.text, 'lxml')
             
             writers = []
@@ -475,7 +550,7 @@ class LyricsCrawlerApp:
             time.sleep(delay)
             url = f"{self.base_url}/composers?page={page_num}"
             self.log(f"    請求URL: {url}")
-            response = requests.get(url, headers=self.headers, timeout=15)
+            response = self.http_get(url, delay)
             soup = BeautifulSoup(response.text, 'lxml')
             
             composers = []
@@ -504,7 +579,7 @@ class LyricsCrawlerApp:
         try:
             time.sleep(delay)
             url = f"{self.base_url}/singers?page={page_num}"
-            response = requests.get(url, headers=self.headers, timeout=15)
+            response = self.http_get(url, delay)
             soup = BeautifulSoup(response.text, 'lxml')
             
             singers = []
@@ -523,18 +598,14 @@ class LyricsCrawlerApp:
             return []
     
     def search_writer(self, writer_name, delay):
-        """在網站中搜尋指定的作詞人。
-
-        支援以下輸入形式：
-        1) 直接輸入人名（例如：方文山）
-        2) 直接輸入作詞人ID（例如：WQY6QJC3）
-        3) 輸入完整或部分URL（例如：https://www.kugeci.com/writer/WQY6QJC3）
-        """
+        """搜尋指定作詞人；優先精確相等，其次模糊包含；支援貼 URL/ID。"""
         import re as _re
 
-        # 1) 嘗試從URL或ID直接解析
+        # 正規化輸入：移除所有空白（避免全形/半形或尾隨空白造成誤判）
+        text = _re.sub(r"\s+", "", writer_name.strip())
+
+        # 1) 先處理 URL/ID 直達
         candidate_id = None
-        text = writer_name.strip()
         if text.startswith('http') and '/writer/' in text:
             try:
                 candidate_id = text.split('/writer/', 1)[1].split('?')[0].strip('/ ')
@@ -548,34 +619,37 @@ class LyricsCrawlerApp:
                 time.sleep(delay)
                 url = urljoin(self.base_url, f"/writer/{candidate_id}")
                 self.log(f"    直接使用ID/URL抓取作詞人頁面: {url}")
-                resp = requests.get(url, headers=self.headers, timeout=15)
+                resp = self.http_get(url, delay)
                 if resp.status_code == 200:
                     soup = BeautifulSoup(resp.text, 'lxml')
                     full_text = soup.get_text('\n')
-                    # 從頁面文本中解析「作詞: XXX」
+                    # 從頁面文本中解析「作詞: XXX」，並去除空白提升比對穩定性
                     match = _re.search(r"作[词詞]\s*[:：]\s*([^\n\r]+)", full_text)
-                    parsed_name = match.group(1).strip() if match else writer_name
-                    if parsed_name:
-                        return {
-                            'name': parsed_name,
-                            'url': url
-                        }
+                    parsed_name = (_re.sub(r"\s+", "", match.group(1)) if match else "")
+                    return {'name': parsed_name or writer_name, 'url': url}
                 else:
                     self.log(f"    ✗ 直接請求失敗 HTTP {resp.status_code}")
             except Exception as _e:
                 self.log(f"    ✗ 直接請求錯誤: {_e}")
 
-        # 2) 回退：遍歷前5頁查找（若服務正常）
-        for page in range(1, 6):
+        # 2) 回退：遍歷前 15 頁；先找精確相等，再找包含匹配
+        exact_hit = None
+        fuzzy_hit = None
+        for page in range(1, 16):
             try:
                 time.sleep(delay)
                 writers = self.get_writers_from_page(page, 0)
                 for writer in writers:
-                    if writer_name in writer['name'] or writer['name'] in writer_name:
-                        return writer
+                    wname = _re.sub(r"\s+", "", writer['name'])
+                    if wname == text and exact_hit is None:
+                        exact_hit = writer
+                    if (text in wname or wname in text) and fuzzy_hit is None:
+                        fuzzy_hit = writer
+                if exact_hit:
+                    break
             except Exception:
                 continue
-        return None
+        return exact_hit or fuzzy_hit
     
     def search_composer(self, composer_name, delay):
         """在前5頁中搜尋指定的作曲人"""
@@ -608,26 +682,43 @@ class LyricsCrawlerApp:
         """爬取指定作詞人的所有歌曲並保存到檔案"""
         try:
             time.sleep(delay)
-            response = requests.get(writer_info['url'], headers=self.headers, timeout=15)
+            response = self.http_get(writer_info['url'], delay)
             soup = BeautifulSoup(response.text, 'lxml')
             
-            table = soup.find('table', {'class': 'table'})
-            if not table:
-                return 0
+            # 解析最大分頁
+            max_page = self._extract_max_page(soup, writer_info['url'])
+            songs_map = {}
             
-            songs = []
-            rows = table.find_all('tr')[1:]
-            for row in rows:
-                cells = row.find_all('td')
-                if len(cells) >= 4:
-                    song_link = cells[1].find('a')
-                    if song_link:
-                        href = song_link['href']
-                        songs.append({
-                            'name': song_link.get_text(strip=True),
-                            'singer': cells[2].get_text(strip=True),
-                            'url': href if href.startswith('http') else urljoin(self.base_url, href)
-                        })
+            def parse_song_table(table_soup):
+                table = table_soup.find('table', {'class': 'table'}) or table_soup.find('table')
+                if not table:
+                    return
+                rows = table.find_all('tr')[1:]
+                for row in rows:
+                    cells = row.find_all('td')
+                    if len(cells) >= 2:
+                        link = cells[1].find('a') or cells[0].find('a')
+                        if not link:
+                            continue
+                        href = link.get('href', '')
+                        song_url = href if href.startswith('http') else urljoin(self.base_url, href)
+                        song_name = link.get_text(strip=True)
+                        singer_name = cells[2].get_text(strip=True) if len(cells) >= 3 else ''
+                        songs_map[song_url] = {
+                            'name': song_name,
+                            'singer': singer_name or '未知歌手',
+                            'url': song_url,
+                        }
+
+            parse_song_table(soup)
+            if max_page > 1:
+                for p in range(2, max_page + 1):
+                    if not self.is_crawling:
+                        break
+                    page_url = self._build_paged_url(writer_info['url'], p)
+                    resp_p = self.http_get(page_url, delay)
+                    parse_song_table(BeautifulSoup(resp_p.text, 'lxml'))
+            songs = list(songs_map.values())
             
             self.log(f"    找到 {len(songs)} 首歌曲")
             
@@ -655,74 +746,66 @@ class LyricsCrawlerApp:
             
         except Exception as e:
             self.log(f"    ✗ 錯誤: {e}")
+            # 輸出調試快照
+            try:
+                debug_dir = os.path.join(base_dir, '_debug')
+                os.makedirs(debug_dir, exist_ok=True)
+                with open(os.path.join(debug_dir, 'writer_error.html'), 'w', encoding='utf-8') as f:
+                    f.write(response.text if 'response' in locals() and hasattr(response, 'text') else '')
+            except Exception:
+                pass
             return 0
     
     def crawl_composer_songs(self, composer_info, base_dir, delay):
         """爬取指定作曲人的所有歌曲並保存到檔案"""
         try:
             time.sleep(delay)
-            response = requests.get(composer_info['url'], headers=self.headers, timeout=15)
+            response = self.http_get(composer_info['url'], delay)
             soup = BeautifulSoup(response.text, 'lxml')
-            
-            # 先嘗試找表格
-            table = soup.find('table', {'class': 'table'})
-            if not table:
-                # 如果沒有找到表格，嘗試其他可能的選擇器
-                table = soup.find('table')
+
+            max_page = self._extract_max_page(soup, composer_info['url'])
+            songs_map = {}
+
+            def parse_table(table_soup):
+                table = table_soup.find('table', {'class': 'table'}) or table_soup.find('table')
                 if not table:
-                    self.log(f"    ✗ 未找到歌曲表格")
-                    return 0
-            
-            songs = []
-            rows = table.find_all('tr')[1:]  # 跳過標題行
-            
-            self.log(f"    解析到 {len(rows)} 行資料")
-            
-            for i, row in enumerate(rows):
-                cells = row.find_all('td')
-                self.log(f"    第{i+1}行有 {len(cells)} 個欄位")
-                
-                if len(cells) >= 2:  # 至少需要2個欄位
-                    # 嘗試不同的欄位組合
-                    song_name = ""
-                    singer_name = ""
-                    song_url = ""
-                    
-                    # 尋找歌曲連結
+                    return
+                rows = table.find_all('tr')[1:]
+                self.log(f"    解析到 {len(rows)} 行資料")
+                for row in rows:
+                    cells = row.find_all('td')
+                    link = None
                     for cell in cells:
-                        link = cell.find('a', href=True)
-                        if link and ('/song/' in link.get('href', '') or '/lyric/' in link.get('href', '')):
-                            song_name = link.get_text(strip=True)
-                            song_url = link.get('href')
+                        a = cell.find('a', href=True)
+                        if a and ('/song/' in a.get('href','') or '/lyric/' in a.get('href','')):
+                            link = a
                             break
-                    
-                    # 如果沒找到歌曲連結，嘗試其他方式
-                    if not song_name and len(cells) >= 2:
-                        # 嘗試從不同欄位獲取歌曲名稱
-                        for j, cell in enumerate(cells):
-                            link = cell.find('a', href=True)
-                            if link:
-                                song_name = link.get_text(strip=True)
-                                song_url = link.get('href')
-                                break
-                        
-                        # 如果還是沒找到，使用第二個欄位的文字
-                        if not song_name and len(cells) >= 2:
-                            song_name = cells[1].get_text(strip=True)
-                    
-                    # 無論是否找到歌曲連結，都要嘗試獲取歌手名稱（第3個欄位是歌手名稱）
-                    if len(cells) >= 3:
-                        singer_name = cells[2].get_text(strip=True)
-                    elif len(cells) >= 4:
-                        singer_name = cells[3].get_text(strip=True)
-                    
-                    if song_name:
-                        songs.append({
-                            'name': song_name,
-                            'singer': singer_name or "未知歌手",
-                            'url': song_url if song_url and song_url.startswith('http') else urljoin(self.base_url, song_url) if song_url else ""
-                        })
-                        self.log(f"      找到歌曲: {song_name} - {singer_name or '未知歌手'}")
+                    if not link and len(cells) >= 2:
+                        a = cells[1].find('a', href=True)
+                        if a:
+                            link = a
+                    if not link:
+                        continue
+                    href = link.get('href','')
+                    song_url = href if href.startswith('http') else urljoin(self.base_url, href)
+                    song_name = link.get_text(strip=True)
+                    singer_name = cells[2].get_text(strip=True) if len(cells) >= 3 else ''
+                    songs_map[song_url] = {
+                        'name': song_name,
+                        'singer': singer_name or '未知歌手',
+                        'url': song_url,
+                    }
+
+            parse_table(soup)
+            if max_page > 1:
+                for p in range(2, max_page + 1):
+                    if not self.is_crawling:
+                        break
+                    page_url = self._build_paged_url(composer_info['url'], p)
+                    resp_p = self.http_get(page_url, delay)
+                    parse_table(BeautifulSoup(resp_p.text, 'lxml'))
+
+            songs = list(songs_map.values())
             
             self.log(f"    總共找到 {len(songs)} 首歌曲")
             
@@ -753,72 +836,66 @@ class LyricsCrawlerApp:
             
         except Exception as e:
             self.log(f"    ✗ 错误: {e}")
+            try:
+                debug_dir = os.path.join(base_dir, '_debug')
+                os.makedirs(debug_dir, exist_ok=True)
+                with open(os.path.join(debug_dir, 'composer_error.html'), 'w', encoding='utf-8') as f:
+                    f.write(response.text if 'response' in locals() and hasattr(response, 'text') else '')
+            except Exception:
+                pass
             return 0
     
     def crawl_singer_songs(self, singer_info, base_dir, delay):
         """爬取指定歌手的所有歌曲並保存到檔案"""
         try:
             time.sleep(delay)
-            response = requests.get(singer_info['url'], headers=self.headers, timeout=15)
+            response = self.http_get(singer_info['url'], delay)
             soup = BeautifulSoup(response.text, 'lxml')
             
-            # 先嘗試找表格
-            table = soup.find('table', {'class': 'table'})
-            if not table:
-                # 如果沒有找到表格，嘗試其他可能的選擇器
-                table = soup.find('table')
+            # 解析最大分頁並收集所有歌曲
+            max_page = self._extract_max_page(soup, singer_info['url'])
+            songs_map = {}
+
+            def parse_table(table_soup):
+                table = table_soup.find('table', {'class': 'table'}) or table_soup.find('table')
                 if not table:
-                    self.log(f"    ✗ 未找到歌曲表格")
-                    return 0
-            
-            songs = []
-            rows = table.find_all('tr')[1:]  # 跳過標題行
-            
-            self.log(f"    解析到 {len(rows)} 行資料")
-            
-            for i, row in enumerate(rows):
-                cells = row.find_all('td')
-                self.log(f"    第{i+1}行有 {len(cells)} 個欄位")
-                
-                if len(cells) >= 2:  # 至少需要2個欄位
-                    # 嘗試不同的欄位組合
-                    song_name = ""
-                    singer_name = ""
-                    song_url = ""
-                    
-                    # 尋找歌曲連結
+                    return
+                rows = table.find_all('tr')[1:]
+                self.log(f"    解析到 {len(rows)} 行資料")
+                for row in rows:
+                    cells = row.find_all('td')
+                    link = None
                     for cell in cells:
-                        link = cell.find('a', href=True)
-                        if link and ('/song/' in link.get('href', '') or '/lyric/' in link.get('href', '')):
-                            song_name = link.get_text(strip=True)
-                            song_url = link.get('href')
+                        a = cell.find('a', href=True)
+                        if a and ('/song/' in a.get('href','') or '/lyric/' in a.get('href','')):
+                            link = a
                             break
-                    
-                    # 如果沒找到歌曲連結，嘗試其他方式
-                    if not song_name and len(cells) >= 2:
-                        for cell in cells:
-                            link = cell.find('a', href=True)
-                            if link:
-                                song_name = link.get_text(strip=True)
-                                song_url = link.get('href')
-                                break
-                        
-                        if not song_name and len(cells) >= 2:
-                            song_name = cells[1].get_text(strip=True)
-                    
-                    # 無論是否找到歌曲連結，都要嘗試獲取歌手名稱（第3個欄位是歌手名稱）
-                    if len(cells) >= 3:
-                        singer_name = cells[2].get_text(strip=True)
-                    elif len(cells) >= 4:
-                        singer_name = cells[3].get_text(strip=True)
-                    
-                    if song_name:
-                        songs.append({
-                            'name': song_name,
-                            'singer': singer_name or singer_info['name'],  # 使用歌手名稱作為預設值
-                            'url': song_url if song_url and song_url.startswith('http') else urljoin(self.base_url, song_url) if song_url else ""
-                        })
-                        self.log(f"      找到歌曲: {song_name} - {singer_name or singer_info['name']}")
+                    if not link and len(cells) >= 2:
+                        a = cells[1].find('a', href=True)
+                        if a:
+                            link = a
+                    if not link:
+                        continue
+                    href = link.get('href','')
+                    song_url = href if href.startswith('http') else urljoin(self.base_url, href)
+                    song_name = link.get_text(strip=True)
+                    singer_name = cells[2].get_text(strip=True) if len(cells) >= 3 else singer_info['name']
+                    songs_map[song_url] = {
+                        'name': song_name,
+                        'singer': singer_name or singer_info['name'],
+                        'url': song_url,
+                    }
+
+            parse_table(soup)
+            if max_page > 1:
+                for p in range(2, max_page + 1):
+                    if not self.is_crawling:
+                        break
+                    page_url = self._build_paged_url(singer_info['url'], p)
+                    resp_p = self.http_get(page_url, delay)
+                    parse_table(BeautifulSoup(resp_p.text, 'lxml'))
+
+            songs = list(songs_map.values())
             
             self.log(f"    總共找到 {len(songs)} 首歌曲")
             
@@ -846,6 +923,13 @@ class LyricsCrawlerApp:
             
         except Exception as e:
             self.log(f"    ✗ 错误: {e}")
+            try:
+                debug_dir = os.path.join(base_dir, '_debug')
+                os.makedirs(debug_dir, exist_ok=True)
+                with open(os.path.join(debug_dir, 'singer_error.html'), 'w', encoding='utf-8') as f:
+                    f.write(response.text if 'response' in locals() and hasattr(response, 'text') else '')
+            except Exception:
+                pass
             return 0
     
     def download_lyrics(self, url, delay):
@@ -856,10 +940,23 @@ class LyricsCrawlerApp:
         """
         try:
             time.sleep(delay)
-            response = requests.get(url, headers=self.headers, timeout=15)
+            response = self.http_get(url, delay)
             soup = BeautifulSoup(response.text, 'lxml')
             
-            # 獲取完整文本
+            # 優先嘗試常見歌詞容器的精確擷取
+            container = None
+            for sel in ['#lyrics', '.lyrics', '.lyric', 'article', 'pre.lyrics', 'pre']:
+                node = soup.select_one(sel)
+                if node and node.get_text(strip=True):
+                    container = node
+                    break
+            if container is not None:
+                raw = container.get_text('\n')
+                clean = [ln.strip() for ln in raw.split('\n') if ln.strip()]
+                if len(clean) >= 3:
+                    return '\n'.join(clean)
+
+            # 回退到全文標記擷取
             text = soup.get_text()
             lines = text.split('\n')
             
@@ -870,11 +967,11 @@ class LyricsCrawlerApp:
             for i, line in enumerate(lines):
                 line = line.strip()
                 # 尋找開始標記：下載txt文檔
-                if '下載txt文檔' in line or 'txt 文檔' in line or '下载txt文档' in line:
+                if ('下載txt文檔' in line or 'txt 文檔' in line or '下载txt文档' in line or '下載TXT文檔' in line or '下载TXT文档' in line):
                     start_idx = i + 1
                     self.log(f"      找到開始標記: {line}")
                 # 尋找結束標記：更多
-                elif '更多' in line and start_idx is not None:
+                elif (('更多' in line) or ('更多内容' in line) or ('更多歌曲' in line)) and start_idx is not None:
                     end_idx = i
                     self.log(f"      找到結束標記: {line}")
                     break
